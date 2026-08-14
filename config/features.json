@@ -1,0 +1,16 @@
+﻿{
+    "raw_price": true,
+    "moving_averages": true,
+    "momentum": true,
+    "volatility": true,
+    "trend": true,
+    "volume": true,
+    "support_resistance": true,
+    "market_structure": true,
+    "liquidity": true,
+    "fvg": true,
+    "order_block": true,
+    "price_action": true,
+    "session": true,
+    "multi_timeframe": true
+}

@@ -1,0 +1,8 @@
+﻿pandas
+numpy
+requests
+python-dotenv
+APScheduler
+python-telegram-bot
+pyarrow
+pytest

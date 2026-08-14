@@ -1,0 +1,30 @@
+﻿{
+    "symbol": "XAU/USD",
+    "provider": "twelve_data",
+    "timezone": "Asia/Jakarta",
+
+    "timeframes": {
+        "H1": {
+            "interval": "1h",
+            "outputsize": 300
+        },
+        "M15": {
+            "interval": "15min",
+            "outputsize": 500
+        },
+        "M5": {
+            "interval": "5min",
+            "outputsize": 1000
+        }
+    },
+
+    "api": {
+        "timeout_seconds": 20,
+        "max_retries": 3
+    },
+
+    "telegram": {
+        "send_summary": true,
+        "send_json": true
+    }
+}

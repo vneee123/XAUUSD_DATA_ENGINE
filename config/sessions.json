@@ -1,0 +1,23 @@
+﻿{
+    "timezone": "Asia/Jakarta",
+
+    "sessions": {
+        "asia": {
+            "enabled": true,
+            "hour": 7,
+            "minute": 0
+        },
+
+        "london": {
+            "enabled": true,
+            "hour": 14,
+            "minute": 0
+        },
+
+        "new_york": {
+            "enabled": true,
+            "hour": 19,
+            "minute": 0
+        }
+    }
+}
