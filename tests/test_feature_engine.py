@@ -18,6 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from collectors.market_data import MarketDataCollector
 from features.engine import FeatureEngine
+from core.data_normalizer import DataNormalizer
+from core.candle_status import CandleStatus
+from core.data_validator import DataValidator
 
 
 # ============================================================
@@ -160,10 +163,10 @@ def get_mathematical_columns(df):
 
 
 # ============================================================
-# INDICATOR RANGE TEST
+# INDICATOR RANGE CHECK
 # ============================================================
 
-def test_indicator_ranges(features):
+def _check_indicator_ranges(features):
 
     print_header(
         "[6] INDICATOR RANGE TEST"
@@ -240,10 +243,10 @@ def test_indicator_ranges(features):
 
 
 # ============================================================
-# NON-NEGATIVE TEST
+# NON-NEGATIVE CHECK
 # ============================================================
 
-def test_non_negative(features):
+def _check_non_negative(features):
 
     print_header(
         "[7] NON-NEGATIVE FEATURE TEST"
@@ -314,10 +317,10 @@ def test_non_negative(features):
 
 
 # ============================================================
-# FEATURE STRUCTURE TEST
+# FEATURE STRUCTURE CHECK
 # ============================================================
 
-def test_structure(features):
+def _check_structure(features):
 
     print_header(
         "[1] FEATURE STRUCTURE"
@@ -426,10 +429,10 @@ def test_structure(features):
 
 
 # ============================================================
-# DATA TYPE TEST
+# DATA TYPE CHECK
 # ============================================================
 
-def test_data_types(features):
+def _check_data_types(features):
 
     print_header(
         "[2] MATHEMATICAL FEATURE DATA TYPES"
@@ -481,10 +484,10 @@ def test_data_types(features):
 
 
 # ============================================================
-# FINITE VALUE TEST
+# FINITE VALUE CHECK
 # ============================================================
 
-def test_finite_values(features):
+def _check_finite_values(features):
 
     print_header(
         "[3] FINITE VALUE TEST"
@@ -540,10 +543,10 @@ def test_finite_values(features):
 
 
 # ============================================================
-# ALL NAN TEST
+# ALL NAN CHECK
 # ============================================================
 
-def test_all_nan(features):
+def _check_all_nan(features):
 
     print_header(
         "[4] ALL-NaN FEATURE TEST"
@@ -580,10 +583,10 @@ def test_all_nan(features):
 
 
 # ============================================================
-# CONSTANT FEATURE TEST
+# CONSTANT FEATURE CHECK
 # ============================================================
 
-def test_constant_features(features):
+def _check_constant_features(features):
 
     print_header(
         "[5] CONSTANT MATHEMATICAL FEATURE TEST"
@@ -634,7 +637,7 @@ def test_constant_features(features):
 # BASE COLUMN INTEGRITY
 # ============================================================
 
-def test_base_columns(features):
+def _check_base_columns(features):
 
     print_header(
         "[8] BASE COLUMN INTEGRITY"
@@ -670,7 +673,7 @@ def test_base_columns(features):
 # TIMESTAMP INTEGRITY
 # ============================================================
 
-def test_timestamp_integrity(features):
+def _check_timestamp_integrity(features):
 
     print_header(
         "[9] FEATURE TIMESTAMP INTEGRITY"
@@ -724,7 +727,7 @@ def test_timestamp_integrity(features):
 # CLOSED ONLY GUARANTEE
 # ============================================================
 
-def test_closed_only(features):
+def _check_closed_only(features):
 
     print_header(
         "[10] CLOSED-ONLY GUARANTEE"
@@ -773,10 +776,10 @@ def test_closed_only(features):
 
 
 # ============================================================
-# DETERMINISM
+# DETERMINISM CHECK
 # ============================================================
 
-def test_determinism(
+def _check_determinism(
     raw_df
 ):
 
@@ -784,6 +787,8 @@ def test_determinism(
         "[11] FEATURE DETERMINISM"
     )
 
+    # Pastikan raw_df sudah melalui pipeline yang sama
+    # Kita gunakan raw_df yang sudah dinormalisasi dan punya candle_status
     first = FeatureEngine.calculate(
         raw_df,
         closed_only=True
@@ -878,16 +883,33 @@ def run_timeframe(
         f"RAW ROWS: {len(raw_df)}"
     )
 
-    features = FeatureEngine.calculate(
+    # =========================================================
+    # INTEGRASI PIPELINE: Normalisasi + CandleStatus + Validasi
+    # =========================================================
+    normalized = DataNormalizer.normalize(
         raw_df,
+        source_timezone="UTC",
+        target_timezone="Asia/Jakarta"
+    )
+
+    with_status = CandleStatus.add_status(normalized)
+
+    # Validasi (opsional, hanya untuk laporan)
+    validator_report = DataValidator.validate(with_status)
+    print(f"VALIDATION REPORT: {validator_report}")
+
+    if not validator_report["valid"]:
+        print("WARNING: Data validation failed. Proceeding anyway for testing.")
+
+    # Sekarang beri ke FeatureEngine
+    features = FeatureEngine.calculate(
+        with_status,
         closed_only=True
     )
 
     print(
         f"CLOSED ROWS: "
-        f"{int((raw_df['candle_status'] == 'CLOSED').sum())}"
-        if "candle_status" in raw_df.columns
-        else "CLOSED ROWS: unknown"
+        f"{int((with_status['candle_status'] == 'CLOSED').sum())}"
     )
 
     print(
@@ -905,27 +927,28 @@ def run_timeframe(
 
     checks = [
 
-        test_structure(features),
+        _check_structure(features),
 
-        test_data_types(features),
+        _check_data_types(features),
 
-        test_finite_values(features),
+        _check_finite_values(features),
 
-        test_all_nan(features),
+        _check_all_nan(features),
 
-        test_constant_features(features),
+        _check_constant_features(features),
 
-        test_indicator_ranges(features),
+        _check_indicator_ranges(features),
 
-        test_non_negative(features),
+        _check_non_negative(features),
 
-        test_base_columns(features),
+        _check_base_columns(features),
 
-        test_timestamp_integrity(features),
+        _check_timestamp_integrity(features),
 
-        test_closed_only(features),
+        _check_closed_only(features),
 
-        test_determinism(raw_df),
+        # determinism butuh raw_df yang sudah melalui pipeline
+        _check_determinism(with_status),
     ]
 
     result = all(checks)
