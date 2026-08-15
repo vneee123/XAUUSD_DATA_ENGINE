@@ -32,6 +32,9 @@ from core.data_normalizer import DataNormalizer
 from core.candle_status import CandleStatus
 from features.engine import FeatureEngine
 from dataset.builder import DatasetBuilder
+from models.trainer import ModelTrainer
+from models.predictor import Predictor
+from signal_engine import SignalEngine
 
 # ============================================================
 # KONFIGURASI MULTI CHAT ID
@@ -41,7 +44,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN must be set")
 
-# Support multiple chat IDs
 chat_ids_env = os.getenv("TELEGRAM_CHAT_IDS")
 if chat_ids_env:
     CHAT_IDS = [cid.strip() for cid in chat_ids_env.split(",") if cid.strip()]
@@ -54,14 +56,12 @@ else:
 
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# SESSION TIMES (WIB)
 SESSION_TIMES = {
     "Tokyo":   {"start": 7,   "end": 16},
     "London":  {"start": 15,  "end": 24},
     "NewYork": {"start": 20,  "end": 5}
 }
 
-# Maksimum baris yang dikirim per file (untuk menghindari ukuran besar)
 MAX_ROWS = 500
 
 # ============================================================
@@ -76,7 +76,7 @@ cache = {
 last_update = None
 
 # ============================================================
-# TELEGRAM SENDER (MULTI CHAT, SUPPORT CSV & JSON)
+# TELEGRAM SENDER
 # ============================================================
 
 def send_message(text):
@@ -88,32 +88,24 @@ def send_message(text):
     return True
 
 def send_file(df, filename="data.csv", caption="", format="csv", max_rows=MAX_ROWS):
-    """
-    Kirim DataFrame sebagai file CSV atau JSON.
-    Jika df terlalu besar, hanya kirim max_rows terakhir dan tambahkan info.
-    """
     if df is None or df.empty:
         send_message("⚠️ DataFrame kosong, tidak bisa dikirim.")
         return
-
     total_rows = len(df)
     if total_rows > max_rows:
         df_to_send = df.tail(max_rows).copy()
         caption += f" (hanya {max_rows} baris terakhir dari total {total_rows} baris)"
     else:
         df_to_send = df.copy()
-
     if format == "json":
-        # JSON lebih ringkas: orient='records' dan compact
         json_str = df_to_send.to_json(orient="records", date_format="iso", indent=None)
         filename = filename.replace(".csv", ".json")
         files = {"document": (filename, json_str, "application/json")}
-    else:  # csv
+    else:
         csv_buffer = StringIO()
         df_to_send.to_csv(csv_buffer, index=False)
         csv_buffer.seek(0)
         files = {"document": (filename, csv_buffer.getvalue(), "text/csv")}
-
     data = {"chat_id": CHAT_IDS[0], "caption": caption}
     url = BASE_URL + "/sendDocument"
     for chat_id in CHAT_IDS:
@@ -123,7 +115,7 @@ def send_file(df, filename="data.csv", caption="", format="csv", max_rows=MAX_RO
     return True
 
 # ============================================================
-# UPDATE CACHE (JALANKAN PIPELINE)
+# UPDATE CACHE
 # ============================================================
 
 def update_cache():
@@ -131,15 +123,11 @@ def update_cache():
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8-sig") as f:
             settings = json.load(f)
-
         symbol = settings["symbol"]
         timeframes = settings["timeframes"]
-
         collector = MarketDataCollector()
         raw_dfs = collector.collect(symbol, timeframes)
-
         processed = {}
-
         for tf, raw_df in raw_dfs.items():
             cache["raw"][tf] = raw_df.copy()
             normalized = DataNormalizer.normalize(raw_df)
@@ -147,7 +135,6 @@ def update_cache():
             features = FeatureEngine.calculate(with_status, closed_only=True)
             cache["features"][tf] = features.copy()
             processed[tf] = features
-
         if "M5" in processed:
             higher_timeframes = ["H1", "M15"]
             higher_dfs = {tf: processed[tf] for tf in higher_timeframes if tf in processed}
@@ -165,7 +152,6 @@ def update_cache():
                 "y": y,
                 "feature_names": feature_names
             }
-
         last_update = datetime.now(ZoneInfo("Asia/Jakarta"))
         print(f"✅ Cache updated at {last_update}")
         return True
@@ -173,10 +159,6 @@ def update_cache():
         print(f"❌ Error updating cache: {e}")
         send_message(f"❌ Error updating cache: {e}")
         return False
-
-# ============================================================
-# GABUNG SEMUA DATA (RAW + FEATURES) MENJADI SATU DF
-# ============================================================
 
 def combine_all_data():
     dfs = []
@@ -197,7 +179,44 @@ def combine_all_data():
     return pd.concat(dfs, ignore_index=True)
 
 # ============================================================
-# SEND SCHEDULED DATA (SATU FILE GABUNGAN, FORMAT JSON)
+# TRAIN MODEL & GET SIGNAL
+# ============================================================
+
+def train_and_get_model():
+    ds = cache["dataset"]
+    if not ds or ds.get("X") is None or ds.get("y") is None:
+        send_message("❌ Dataset tidak tersedia untuk training.")
+        return None
+    X = ds["X"]
+    y = ds["y"]
+    model, acc, report = ModelTrainer.train(X, y, model_type="random_forest")
+    # Simpan model
+    Predictor.save_model(model, "random_forest")
+    send_message(f"🧠 Model trained with accuracy: {acc:.3f}")
+    return model
+
+def get_signal_from_cache():
+    # Coba load model, jika tidak ada, train dulu
+    try:
+        model = Predictor.load_model("random_forest")
+    except FileNotFoundError:
+        send_message("🧠 Model belum ada. Melatih model dari dataset...")
+        model = train_and_get_model()
+        if model is None:
+            send_message("❌ Gagal melatih model.")
+            return None
+
+    # Ambil features M5
+    features_df = cache["features"].get("M5")
+    if features_df is None or features_df.empty:
+        send_message("❌ Features M5 tidak tersedia.")
+        return None
+
+    signal = SignalEngine.generate_signal(features_df, model, threshold=0.6)
+    return signal
+
+# ============================================================
+# SEND SCHEDULED DATA
 # ============================================================
 
 def send_scheduled_data(format="json"):
@@ -205,11 +224,9 @@ def send_scheduled_data(format="json"):
     success = update_cache()
     if not success:
         return
-
     combined = combine_all_data()
     if combined is not None and not combined.empty:
         send_file(combined, filename=f"all_data.{format}", caption="📊 Semua data (raw+features) semua timeframe", format=format)
-
     ds = cache["dataset"]
     if ds and ds.get("X") is not None and ds.get("y") is not None:
         X = ds["X"]
@@ -219,7 +236,6 @@ def send_scheduled_data(format="json"):
             df_dataset = pd.DataFrame(X, columns=feature_names)
             df_dataset["label"] = y
             send_file(df_dataset, filename=f"dataset.{format}", caption="🤖 Dataset ML", format=format)
-
     send_message("✅ **Semua data terjadwal telah terkirim.**")
 
 # ============================================================
@@ -237,28 +253,56 @@ def handle_command(text, chat_id):
         help_text = (
             "🤖 **XAUUSD_DATA_ENGINE Bot**\n\n"
             "📌 **Command:**\n"
-            "/raw [tf] [format]    - Kirim data mentah (contoh: /raw M5 json)\n"
+            "/signal              - Kirim sinyal trading + limit order\n"
+            "/raw [tf] [format]   - Kirim data mentah (contoh: /raw M5 json)\n"
             "/features [tf] [format] - Kirim feature engineering\n"
-            "/dataset [format]     - Kirim dataset ML\n"
-            "/all [format]         - Kirim SATU FILE gabungan semua raw+features + dataset\n"
-            "/send_now [format]    - Kirim data terjadwal (format csv/json)\n"
-            "/status               - Status cache\n"
-            "/info                 - Informasi sistem\n"
-            "/get_chat_id          - Tampilkan chat ID Anda\n"
-            "/help                 - Bantuan\n\n"
-            "🕒 Jadwal otomatis: Tokyo (07-16), London (15-24), NewYork (20-05) WIB\n"
-            "📦 Format default: json (ringan). Bisa pilih csv jika perlu."
+            "/dataset [format]    - Kirim dataset ML\n"
+            "/all [format]        - Kirim SATU FILE gabungan semua data\n"
+            "/send_now [format]   - Kirim data terjadwal\n"
+            "/train               - Latih ulang model\n"
+            "/status              - Status cache\n"
+            "/info                - Informasi sistem\n"
+            "/get_chat_id         - Tampilkan chat ID Anda\n"
+            "/help                - Bantuan\n\n"
+            "🕒 Jadwal otomatis: Tokyo (07-16), London (15-24), NewYork (20-05) WIB"
         )
         send_message(help_text)
 
-    # Ambil format dari argumen terakhir jika ada
-    fmt = "json"  # default
+    fmt = "json"
     if args and args[-1].lower() in ["csv", "json"]:
         fmt = args[-1].lower()
-        args = args[:-1]  # hapus format dari args
+        args = args[:-1]
 
     if cmd == "/get_chat_id":
         send_message(f"🆔 Chat ID Anda: {chat_id}")
+
+    elif cmd == "/train":
+        send_message("🧠 Melatih ulang model...")
+        model = train_and_get_model()
+        if model:
+            send_message("✅ Model berhasil dilatih dan disimpan.")
+        else:
+            send_message("❌ Gagal melatih model.")
+
+    elif cmd == "/signal":
+        send_message("📈 **Menghasilkan sinyal trading...**")
+        signal = get_signal_from_cache()
+        if signal is None:
+            return
+        if signal["signal"] == "HOLD":
+            msg = f"⚠️ **HOLD**\nConfidence: {signal['confidence']:.2f}\nTidak ada sinyal kuat."
+        else:
+            msg = (
+                f"🚦 **{signal['signal']}**\n"
+                f"📊 Entry: {signal['entry']:.3f}\n"
+                f"🛑 Stop Loss: {signal['stop_loss']:.3f}\n"
+                f"🎯 Take Profit 1: {signal['take_profit_1']:.3f}\n"
+                f"🎯 Take Profit 2: {signal['take_profit_2']:.3f}\n"
+                f"📈 Close: {signal['close_price']:.3f}\n"
+                f"📉 ATR: {signal['atr']:.3f}\n"
+                f"🧠 Confidence: {signal['confidence']:.2f}"
+            )
+        send_message(msg)
 
     elif cmd == "/raw":
         tf = args[0] if args else "M5"
@@ -304,7 +348,6 @@ def handle_command(text, chat_id):
         send_message("✅ **Semua data terkirim.**")
 
     elif cmd == "/send_now":
-        # format dari argumen jika ada
         send_scheduled_data(format=fmt)
 
     elif cmd == "/status":
@@ -322,10 +365,10 @@ def handle_command(text, chat_id):
     elif cmd == "/info":
         info = "📌 **XAUUSD_DATA_ENGINE Bot**\n"
         info += f"🕒 Waktu server: {datetime.now(ZoneInfo('Asia/Jakarta'))}\n"
-        info += "⚙️ Pipeline: Normalizer → CandleStatus → FeatureEngine → MultiTimeframe → Dataset\n"
+        info += "⚙️ Pipeline: Normalizer → CandleStatus → FeatureEngine → MultiTimeframe → Dataset → ML Model\n"
         info += f"📨 Chat IDs aktif: {CHAT_IDS}\n"
         info += f"📦 Maks baris per file: {MAX_ROWS}\n"
-        info += "📦 Versi: 1.2"
+        info += "📦 Versi: 1.3"
         send_message(info)
 
     else:
@@ -383,7 +426,6 @@ def run_scheduler():
                 if last_sent[session] != now.date():
                     print(f"⏰ Triggering scheduled send for {session} at {now}")
                     try:
-                        # Kirim dalam format JSON (ringan) secara default
                         send_scheduled_data(format="json")
                         last_sent[session] = now.date()
                     except Exception as e:
@@ -395,10 +437,17 @@ def run_scheduler():
 # ============================================================
 
 def main():
-    print("🚀 Starting Telegram Bot + Scheduler (Multi Chat, JSON default)...")
+    print("🚀 Starting Telegram Bot + Scheduler + ML Signal...")
     print(f"📨 Target chat IDs: {CHAT_IDS}")
     print(f"📦 Maks baris per file: {MAX_ROWS}")
     update_cache()
+    # Pre-train model di awal (opsional)
+    try:
+        Predictor.load_model("random_forest")
+        print("✅ Model already exists.")
+    except FileNotFoundError:
+        print("🧠 Model not found, training...")
+        train_and_get_model()
 
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
