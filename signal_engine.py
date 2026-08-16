@@ -2,57 +2,38 @@
 import pandas as pd
 from models.predictor import Predictor
 
+# Konfigurasi: 1 pip = 0.1 points (XAUUSD)
+PIP_SIZE = 0.1
+SL_PIPS = 50       # 50 pips = 5.0 points
+TP1_PIPS = 50      # 50 pips = 5.0 points
+TP2_PIPS = 100     # 100 pips = 10.0 points
+
 class SignalEngine:
     @staticmethod
-    def generate_signal(features_df, model, threshold=0.6):
-        """
-        Generate trading signal from the latest row of features_df.
-        Returns dict with signal, entry, stop_loss, take_profit levels.
-        """
-        if features_df is None or features_df.empty:
-            return None
-
-        # Ambil baris terakhir
-        latest = features_df.iloc[-1:].copy()
-        close_price = latest["close"].values[0]
-        atr = latest["atr_14"].values[0] if "atr_14" in latest.columns else 0.5
-
-        # Kolom fitur yang digunakan untuk prediksi (semua kecuali base/metadata)
-        base_cols = {
-            "datetime", "datetime_local", "open", "high", "low", "close",
-            "symbol", "interval", "candle_close_time", "candle_status",
-            "candle_closed", "interval_minutes", "is_current_candle",
-            "is_future_data", "source_timezone", "target_timezone"
-        }
-        feature_cols = [col for col in latest.columns if col not in base_cols]
-        X = latest[feature_cols].values.astype(np.float32)
-
-        # Prediksi
+    def generate_signal_with_X(X, model, feature_names, latest_df, threshold=0.6):
         pred, proba = Predictor.predict(model, X)
         prob = proba[0] if proba is not None else [0.5, 0.5]
         confidence = max(prob)
         signal_class = int(pred[0])
 
-        # Hitung level order
-        # Support/resistance dari rolling high/low dan Bollinger
-        bb_upper = latest["bb_upper_20"].values[0] if "bb_upper_20" in latest.columns else close_price + atr
-        bb_lower = latest["bb_lower_20"].values[0] if "bb_lower_20" in latest.columns else close_price - atr
-        rolling_high = latest["rolling_high_5"].values[0] if "rolling_high_5" in latest.columns else close_price + atr
-        rolling_low = latest["rolling_low_5"].values[0] if "rolling_low_5" in latest.columns else close_price - atr
+        close_price = latest_df["close"].values[0]
+        atr = latest_df["atr_14"].values[0] if "atr_14" in latest_df.columns else 1.0
+
+        sl_points = SL_PIPS * PIP_SIZE
+        tp1_points = TP1_PIPS * PIP_SIZE
+        tp2_points = TP2_PIPS * PIP_SIZE
 
         if signal_class == 1 and confidence >= threshold:
-            # BUY signal
-            entry = min(bb_lower, rolling_low)  # entry di support
-            stop_loss = entry - atr * 1.5
-            take_profit_1 = entry + atr * 2.5
-            take_profit_2 = entry + atr * 4.0
+            entry = close_price
+            stop_loss = entry - sl_points
+            take_profit_1 = entry + tp1_points
+            take_profit_2 = entry + tp2_points
             signal = "BUY"
         elif signal_class == 0 and confidence >= threshold:
-            # SELL signal
-            entry = max(bb_upper, rolling_high)  # entry di resistance
-            stop_loss = entry + atr * 1.5
-            take_profit_1 = entry - atr * 2.5
-            take_profit_2 = entry - atr * 4.0
+            entry = close_price
+            stop_loss = entry + sl_points
+            take_profit_1 = entry - tp1_points
+            take_profit_2 = entry - tp2_points
             signal = "SELL"
         else:
             signal = "HOLD"
@@ -67,5 +48,8 @@ class SignalEngine:
             "close_price": close_price,
             "atr": atr,
             "confidence": confidence,
-            "predicted_class": signal_class
+            "predicted_class": signal_class,
+            "sl_pips": SL_PIPS,
+            "tp1_pips": TP1_PIPS,
+            "tp2_pips": TP2_PIPS
         }

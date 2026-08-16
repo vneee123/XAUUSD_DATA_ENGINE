@@ -7,9 +7,10 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 class Predictor:
     @staticmethod
-    def save_model(model, name="random_forest"):
+    def save_model(model, feature_names, name="random_forest"):
         path = MODEL_DIR / f"{name}.pkl"
-        joblib.dump(model, path)
+        data = {"model": model, "feature_names": feature_names}
+        joblib.dump(data, path)
         return path
 
     @staticmethod
@@ -17,11 +18,14 @@ class Predictor:
         path = MODEL_DIR / f"{name}.pkl"
         if not path.exists():
             raise FileNotFoundError(f"Model {name} not found at {path}")
-        return joblib.load(path)
+        data = joblib.load(path)
+        return data["model"], data["feature_names"]
 
     @staticmethod
     def predict(model, X):
-        """X must be 2D array (n_samples, n_features)"""
+        """Predict class and probabilities for given X."""
         if len(X.shape) == 1:
             X = X.reshape(1, -1)
-        return model.predict(X), model.predict_proba(X)
+        pred = model.predict(X)
+        proba = model.predict_proba(X) if hasattr(model, "predict_proba") else None
+        return pred, proba

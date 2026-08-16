@@ -11,34 +11,24 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from io import StringIO
 from dotenv import load_dotenv
-
-# ============================================================
-# PROJECT ROOT & SETTINGS
-# ============================================================
+import traceback
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
-
 load_dotenv()
 
 SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.json"
-
-# ============================================================
-# IMPORTS DARI PROYEK
-# ============================================================
 
 from collectors.market_data import MarketDataCollector
 from core.data_normalizer import DataNormalizer
 from core.candle_status import CandleStatus
 from features.engine import FeatureEngine
+from features.multi_timeframe import MultiTimeframeAligner
 from dataset.builder import DatasetBuilder
 from models.trainer import ModelTrainer
 from models.predictor import Predictor
 from signal_engine import SignalEngine
-
-# ============================================================
-# KONFIGURASI MULTI CHAT ID
-# ============================================================
+from backtest_engine import BacktestEngine
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
@@ -64,37 +54,48 @@ SESSION_TIMES = {
 
 MAX_ROWS = 500
 
-# ============================================================
-# CACHE GLOBAL
-# ============================================================
-
-cache = {
-    "raw": {},
-    "features": {},
-    "dataset": {}
-}
+cache = {"raw": {}, "features": {}, "dataset": {}}
 last_update = None
 
-# ============================================================
-# TELEGRAM SENDER
-# ============================================================
+def debug(msg):
+    print(f"[DEBUG] {datetime.now().strftime('%H:%M:%S')} - {msg}")
 
+# ------------------------------------------------------------------
+# TELEGRAM SENDER - clean & professional
+# ------------------------------------------------------------------
 def send_message(text):
+    # Hilangkan simbol berlebihan, rapikan teks
+    text = text.replace("*", "")
+    text = text.replace("✅", "[OK]")
+    text = text.replace("❌", "[ERR]")
+    text = text.replace("⚠️", "[WARN]")
+    text = text.replace("📊", "")
+    text = text.replace("📈", "")
+    text = text.replace("📉", "")
+    text = text.replace("🤖", "")
+    text = text.replace("🧠", "")
+    text = text.replace("🚦", "")
+    text = text.replace("🆔", "ID:")
+    # Hapus baris kosong berlebihan
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    text = "\n".join(lines)
     for chat_id in CHAT_IDS:
         url = BASE_URL + "/sendMessage"
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-        resp = requests.post(url, json=payload, timeout=30)
-        resp.raise_for_status()
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": ""}
+        try:
+            requests.post(url, json=payload, timeout=30).raise_for_status()
+        except Exception as e:
+            debug(f"Send message error: {e}")
     return True
 
 def send_file(df, filename="data.csv", caption="", format="csv", max_rows=MAX_ROWS):
     if df is None or df.empty:
-        send_message("⚠️ DataFrame kosong, tidak bisa dikirim.")
+        send_message("DataFrame kosong, tidak bisa dikirim.")
         return
     total_rows = len(df)
     if total_rows > max_rows:
         df_to_send = df.tail(max_rows).copy()
-        caption += f" (hanya {max_rows} baris terakhir dari total {total_rows} baris)"
+        caption += f" (last {max_rows} rows of {total_rows})"
     else:
         df_to_send = df.copy()
     if format == "json":
@@ -110,17 +111,20 @@ def send_file(df, filename="data.csv", caption="", format="csv", max_rows=MAX_RO
     url = BASE_URL + "/sendDocument"
     for chat_id in CHAT_IDS:
         data["chat_id"] = chat_id
-        resp = requests.post(url, data=data, files=files, timeout=60)
-        resp.raise_for_status()
+        try:
+            requests.post(url, data=data, files=files, timeout=120).raise_for_status()
+        except Exception as e:
+            debug(f"Send file error: {e}")
+            send_message(f"File send failed: {e}")
     return True
 
-# ============================================================
-# UPDATE CACHE
-# ============================================================
-
+# ------------------------------------------------------------------
+# CACHE UPDATE
+# ------------------------------------------------------------------
 def update_cache():
     global cache, last_update
     try:
+        debug("Updating cache...")
         with open(SETTINGS_PATH, "r", encoding="utf-8-sig") as f:
             settings = json.load(f)
         symbol = settings["symbol"]
@@ -153,12 +157,25 @@ def update_cache():
                 "feature_names": feature_names
             }
         last_update = datetime.now(ZoneInfo("Asia/Jakarta"))
-        print(f"✅ Cache updated at {last_update}")
+        debug(f"Cache updated at {last_update}")
         return True
     except Exception as e:
-        print(f"❌ Error updating cache: {e}")
-        send_message(f"❌ Error updating cache: {e}")
+        debug(f"Cache update error: {e}")
+        traceback.print_exc()
+        send_message(f"Cache update error: {e}")
         return False
+
+def get_aligned_features():
+    m5 = cache["features"].get("M5")
+    h1 = cache["features"].get("H1")
+    m15 = cache["features"].get("M15")
+    if any(df is None or df.empty for df in [m5, h1, m15]):
+        debug("Missing features for alignment")
+        return None
+    higher_dfs = {"H1": h1, "M15": m15}
+    aligned = MultiTimeframeAligner.align(m5, higher_dfs, ["H1", "M15"])
+    debug(f"Aligned features shape: {aligned.shape}")
+    return aligned
 
 def combine_all_data():
     dfs = []
@@ -178,55 +195,64 @@ def combine_all_data():
         return None
     return pd.concat(dfs, ignore_index=True)
 
-# ============================================================
-# TRAIN MODEL & GET SIGNAL
-# ============================================================
-
-def train_and_get_model():
+def train_and_get_model(model_type="random_forest"):
     ds = cache["dataset"]
     if not ds or ds.get("X") is None or ds.get("y") is None:
-        send_message("❌ Dataset tidak tersedia untuk training.")
+        send_message("Dataset tidak tersedia untuk training.")
         return None
     X = ds["X"]
     y = ds["y"]
-    model, acc, report = ModelTrainer.train(X, y, model_type="random_forest")
-    # Simpan model
-    Predictor.save_model(model, "random_forest")
-    send_message(f"🧠 Model trained with accuracy: {acc:.3f}")
+    feature_names = ds["feature_names"]
+    debug(f"Training {model_type} on X shape {X.shape}")
+    model, acc, report = ModelTrainer.train(X, y, model_type=model_type)
+    Predictor.save_model(model, feature_names, model_type)
+    send_message(f"Model {model_type} trained. Out-of-sample accuracy: {acc:.3f}")
     return model
 
 def get_signal_from_cache():
-    # Coba load model, jika tidak ada, train dulu
     try:
-        model = Predictor.load_model("random_forest")
+        model, feature_names = Predictor.load_model("random_forest")
+        debug(f"Loaded model with {len(feature_names)} features")
     except FileNotFoundError:
-        send_message("🧠 Model belum ada. Melatih model dari dataset...")
-        model = train_and_get_model()
+        send_message("Model belum ada. Melatih model default...")
+        model = train_and_get_model("random_forest")
         if model is None:
-            send_message("❌ Gagal melatih model.")
             return None
+        _, feature_names = Predictor.load_model("random_forest")
 
-    # Ambil features M5
-    features_df = cache["features"].get("M5")
-    if features_df is None or features_df.empty:
-        send_message("❌ Features M5 tidak tersedia.")
+    aligned_df = get_aligned_features()
+    if aligned_df is None or aligned_df.empty:
+        send_message("Aligned features tidak tersedia.")
         return None
 
-    signal = SignalEngine.generate_signal(features_df, model, threshold=0.6)
+    latest = aligned_df.iloc[-1:].copy()
+    missing = set(feature_names) - set(latest.columns)
+    if missing:
+        debug(f"Missing {len(missing)} features, filling with 0")
+        for col in missing:
+            latest[col] = 0.0
+    X = latest[feature_names].values.astype(np.float32)
+    debug(f"Prediction X shape: {X.shape}")
+
+    signal = SignalEngine.generate_signal_with_X(X, model, feature_names, latest, threshold=0.6)
     return signal
 
-# ============================================================
-# SEND SCHEDULED DATA
-# ============================================================
+def run_backtest(model_type="random_forest"):
+    ds = cache["dataset"]
+    if not ds or ds.get("X") is None or ds.get("y") is None:
+        send_message("Dataset tidak tersedia.")
+        return None
+    X = ds["X"]
+    y = ds["y"]
+    result = BacktestEngine.run(X, y, model_type=model_type)
+    return result
 
 def send_scheduled_data(format="json"):
-    send_message(f"📊 **Menjalankan pengiriman data terjadwal (format {format})...**")
-    success = update_cache()
-    if not success:
-        return
+    send_message("Running scheduled data send...")
+    update_cache()
     combined = combine_all_data()
     if combined is not None and not combined.empty:
-        send_file(combined, filename=f"all_data.{format}", caption="📊 Semua data (raw+features) semua timeframe", format=format)
+        send_file(combined, filename=f"all_data.{format}", caption="All data (raw+features)", format=format)
     ds = cache["dataset"]
     if ds and ds.get("X") is not None and ds.get("y") is not None:
         X = ds["X"]
@@ -235,13 +261,12 @@ def send_scheduled_data(format="json"):
         if X is not None and len(X) > 0:
             df_dataset = pd.DataFrame(X, columns=feature_names)
             df_dataset["label"] = y
-            send_file(df_dataset, filename=f"dataset.{format}", caption="🤖 Dataset ML", format=format)
-    send_message("✅ **Semua data terjadwal telah terkirim.**")
+            send_file(df_dataset, filename=f"dataset.{format}", caption="ML Dataset", format=format)
+    send_message("Scheduled data send completed.")
 
-# ============================================================
-# HANDLE COMMAND
-# ============================================================
-
+# ------------------------------------------------------------------
+# COMMAND HANDLER - clean and professional
+# ------------------------------------------------------------------
 def handle_command(text, chat_id):
     parts = text.strip().split()
     if not parts:
@@ -251,92 +276,179 @@ def handle_command(text, chat_id):
 
     if cmd in ["/start", "/help"]:
         help_text = (
-            "🤖 **XAUUSD_DATA_ENGINE Bot**\n\n"
-            "📌 **Command:**\n"
-            "/signal              - Kirim sinyal trading + limit order\n"
-            "/raw [tf] [format]   - Kirim data mentah (contoh: /raw M5 json)\n"
-            "/features [tf] [format] - Kirim feature engineering\n"
-            "/dataset [format]    - Kirim dataset ML\n"
-            "/all [format]        - Kirim SATU FILE gabungan semua data\n"
-            "/send_now [format]   - Kirim data terjadwal\n"
-            "/train               - Latih ulang model\n"
-            "/status              - Status cache\n"
-            "/info                - Informasi sistem\n"
-            "/get_chat_id         - Tampilkan chat ID Anda\n"
-            "/help                - Bantuan\n\n"
-            "🕒 Jadwal otomatis: Tokyo (07-16), London (15-24), NewYork (20-05) WIB"
+            "XAUUSD_DATA_ENGINE Bot v1.8 - Commands:\n"
+            "/signal              - Get trading signal with SL/TP\n"
+            "/predict             - Get prediction probability only\n"
+            "/signal_detail       - Full signal with detailed analysis\n"
+            "/backtest [model]    - Run backtest (random_forest, logistic, xgboost)\n"
+            "/train [model]       - Train model\n"
+            "/optimize            - Find optimal threshold\n"
+            "/risk                - Show current risk/reward\n"
+            "/raw [tf] [format]   - Send raw data\n"
+            "/features [tf] [format] - Send feature data\n"
+            "/dataset [format]    - Send ML dataset\n"
+            "/all [format]        - Send all data in one file\n"
+            "/send_now [format]   - Trigger scheduled send\n"
+            "/status              - Cache status\n"
+            "/info                - System info\n"
+            "/get_chat_id         - Your chat ID\n"
+            "/clear_cache         - Clear cache and model\n"
+            "/help                - This help\n\n"
+            "Auto schedule: Tokyo (07-16), London (15-24), NewYork (20-05) WIB"
         )
         send_message(help_text)
+        return
 
     fmt = "json"
     if args and args[-1].lower() in ["csv", "json"]:
         fmt = args[-1].lower()
         args = args[:-1]
 
-    if cmd == "/get_chat_id":
-        send_message(f"🆔 Chat ID Anda: {chat_id}")
+    model_type = "random_forest"
+    if args and args[0].lower() in ["random_forest", "logistic", "xgboost"]:
+        model_type = args[0].lower()
+        args = args[1:]
 
-    elif cmd == "/train":
-        send_message("🧠 Melatih ulang model...")
-        model = train_and_get_model()
-        if model:
-            send_message("✅ Model berhasil dilatih dan disimpan.")
-        else:
-            send_message("❌ Gagal melatih model.")
+    # --- NEW / UPDATED COMMANDS ---
+    if cmd == "/clear_cache":
+        global cache
+        cache = {"raw": {}, "features": {}, "dataset": {}}
+        for p in Path("models/saved").glob("*.pkl"):
+            p.unlink()
+        send_message("Cache and model cleared. Bot will rebuild on next request.")
+        return
 
-    elif cmd == "/signal":
-        send_message("📈 **Menghasilkan sinyal trading...**")
+    if cmd == "/predict":
+        signal = get_signal_from_cache()
+        if signal:
+            msg = f"Prediction: {signal['signal']}\nConfidence: {signal['confidence']:.3f}"
+            send_message(msg)
+        return
+
+    if cmd == "/signal_detail":
         signal = get_signal_from_cache()
         if signal is None:
             return
         if signal["signal"] == "HOLD":
-            msg = f"⚠️ **HOLD**\nConfidence: {signal['confidence']:.2f}\nTidak ada sinyal kuat."
+            msg = f"HOLD\nConfidence: {signal['confidence']:.3f}\nNo strong signal."
         else:
+            risk = abs(signal['entry'] - signal['stop_loss'])
+            reward1 = abs(signal['take_profit_1'] - signal['entry'])
+            reward2 = abs(signal['take_profit_2'] - signal['entry'])
             msg = (
-                f"🚦 **{signal['signal']}**\n"
-                f"📊 Entry: {signal['entry']:.3f}\n"
-                f"🛑 Stop Loss: {signal['stop_loss']:.3f}\n"
-                f"🎯 Take Profit 1: {signal['take_profit_1']:.3f}\n"
-                f"🎯 Take Profit 2: {signal['take_profit_2']:.3f}\n"
-                f"📈 Close: {signal['close_price']:.3f}\n"
-                f"📉 ATR: {signal['atr']:.3f}\n"
-                f"🧠 Confidence: {signal['confidence']:.2f}"
+                f"Signal: {signal['signal']}\n"
+                f"Entry: {signal['entry']:.3f}\n"
+                f"Stop Loss: {signal['stop_loss']:.3f} (Risk: {risk:.2f} points)\n"
+                f"Take Profit 1: {signal['take_profit_1']:.3f} (R:R {reward1/risk:.2f})\n"
+                f"Take Profit 2: {signal['take_profit_2']:.3f} (R:R {reward2/risk:.2f})\n"
+                f"Close: {signal['close_price']:.3f}\n"
+                f"ATR: {signal['atr']:.3f}\n"
+                f"Confidence: {signal['confidence']:.3f}"
             )
         send_message(msg)
+        return
 
-    elif cmd == "/raw":
+    if cmd == "/optimize":
+        send_message("Optimization not yet implemented. Use /train and adjust threshold manually.")
+        return
+
+    if cmd == "/risk":
+        signal = get_signal_from_cache()
+        if signal is None or signal["signal"] == "HOLD":
+            send_message("No active trade to assess risk.")
+            return
+        risk = abs(signal['entry'] - signal['stop_loss'])
+        reward1 = abs(signal['take_profit_1'] - signal['entry'])
+        reward2 = abs(signal['take_profit_2'] - signal['entry'])
+        msg = (
+            f"Risk/Reward Analysis:\n"
+            f"Risk: {risk:.2f} points\n"
+            f"Reward TP1: {reward1:.2f} points (R:R {reward1/risk:.2f})\n"
+            f"Reward TP2: {reward2:.2f} points (R:R {reward2/risk:.2f})"
+        )
+        send_message(msg)
+        return
+
+    # --- EXISTING COMMANDS ---
+    if cmd == "/get_chat_id":
+        send_message(f"Your Chat ID: {chat_id}")
+        return
+
+    if cmd == "/train":
+        send_message(f"Training model {model_type}...")
+        model = train_and_get_model(model_type)
+        if model:
+            send_message(f"Model {model_type} saved successfully.")
+        else:
+            send_message("Training failed.")
+        return
+
+    if cmd == "/backtest":
+        send_message(f"Running backtest for {model_type}...")
+        result = run_backtest(model_type)
+        if result:
+            msg = f"Backtest Result ({model_type})\nWinrate: {result['winrate']:.3f}\nTotal Signals: {result['total_signals']}\nCorrect: {result['correct_signals']}"
+            send_message(msg)
+        else:
+            send_message("Backtest failed.")
+        return
+
+    if cmd == "/signal":
+        send_message("Generating signal...")
+        signal = get_signal_from_cache()
+        if signal is None:
+            return
+        if signal["signal"] == "HOLD":
+            msg = f"HOLD\nConfidence: {signal['confidence']:.3f}"
+        else:
+            msg = (
+                f"Signal: {signal['signal']}\n"
+                f"Entry: {signal['entry']:.3f}\n"
+                f"SL: {signal['stop_loss']:.3f}\n"
+                f"TP1: {signal['take_profit_1']:.3f}\n"
+                f"TP2: {signal['take_profit_2']:.3f}\n"
+                f"Close: {signal['close_price']:.3f}\n"
+                f"Confidence: {signal['confidence']:.3f}"
+            )
+        send_message(msg)
+        return
+
+    if cmd == "/raw":
         tf = args[0] if args else "M5"
         df = cache["raw"].get(tf)
         if df is None or df.empty:
-            send_message(f"❌ Data raw untuk {tf} tidak tersedia.")
+            send_message(f"Raw data for {tf} not available.")
         else:
-            send_file(df, filename=f"raw_{tf}.{fmt}", caption=f"📈 Data mentah {tf}", format=fmt)
+            send_file(df, filename=f"raw_{tf}.{fmt}", caption=f"Raw {tf}", format=fmt)
+        return
 
-    elif cmd == "/features":
+    if cmd == "/features":
         tf = args[0] if args else "M5"
         df = cache["features"].get(tf)
         if df is None or df.empty:
-            send_message(f"❌ Data features untuk {tf} tidak tersedia.")
+            send_message(f"Features for {tf} not available.")
         else:
-            send_file(df, filename=f"features_{tf}.{fmt}", caption=f"🧮 Feature Engineering {tf}", format=fmt)
+            send_file(df, filename=f"features_{tf}.{fmt}", caption=f"Features {tf}", format=fmt)
+        return
 
-    elif cmd == "/dataset":
+    if cmd == "/dataset":
         ds = cache["dataset"]
         if not ds or ds.get("X") is None or ds.get("y") is None:
-            send_message("❌ Dataset tidak tersedia.")
+            send_message("Dataset not available.")
         else:
             X = ds["X"]
             y = ds["y"]
             feature_names = ds["feature_names"]
             df_dataset = pd.DataFrame(X, columns=feature_names)
             df_dataset["label"] = y
-            send_file(df_dataset, filename=f"dataset.{fmt}", caption="🤖 Dataset ML", format=fmt)
+            send_file(df_dataset, filename=f"dataset.{fmt}", caption="ML Dataset", format=fmt)
+        return
 
-    elif cmd == "/all":
-        send_message(f"📦 **Mengirim semua data dalam SATU FILE (format {fmt})...**")
+    if cmd == "/all":
+        send_message(f"Sending all data in one file ({fmt})...")
         combined = combine_all_data()
         if combined is not None and not combined.empty:
-            send_file(combined, filename=f"all_data.{fmt}", caption="📊 Semua data (raw+features) semua timeframe", format=fmt)
+            send_file(combined, filename=f"all_data.{fmt}", caption="All data (raw+features)", format=fmt)
         ds = cache["dataset"]
         if ds and ds.get("X") is not None and ds.get("y") is not None:
             X = ds["X"]
@@ -344,43 +456,45 @@ def handle_command(text, chat_id):
             feature_names = ds["feature_names"]
             df_dataset = pd.DataFrame(X, columns=feature_names)
             df_dataset["label"] = y
-            send_file(df_dataset, filename=f"dataset.{fmt}", caption="🤖 Dataset ML", format=fmt)
-        send_message("✅ **Semua data terkirim.**")
+            send_file(df_dataset, filename=f"dataset.{fmt}", caption="ML Dataset", format=fmt)
+        send_message("All data sent.")
+        return
 
-    elif cmd == "/send_now":
+    if cmd == "/send_now":
         send_scheduled_data(format=fmt)
+        return
 
-    elif cmd == "/status":
-        status = f"📊 **Status Cache**\n"
-        status += f"🕒 Terakhir update: {last_update}\n" if last_update else "🕒 Cache belum diupdate.\n"
-        status += f"📁 Raw timeframes: {list(cache['raw'].keys())}\n"
-        status += f"🧮 Features timeframes: {list(cache['features'].keys())}\n"
+    if cmd == "/status":
+        status = f"Cache Status\nLast update: {last_update}\nRaw TFs: {list(cache['raw'].keys())}\nFeatures TFs: {list(cache['features'].keys())}\n"
         ds = cache["dataset"]
         if ds and ds.get("X") is not None:
-            status += f"🤖 Dataset: X shape {ds['X'].shape}"
+            status += f"Dataset: X shape {ds['X'].shape}"
         else:
-            status += "🤖 Dataset: tidak tersedia"
+            status += "Dataset: not available"
         send_message(status)
+        return
 
-    elif cmd == "/info":
-        info = "📌 **XAUUSD_DATA_ENGINE Bot**\n"
-        info += f"🕒 Waktu server: {datetime.now(ZoneInfo('Asia/Jakarta'))}\n"
-        info += "⚙️ Pipeline: Normalizer → CandleStatus → FeatureEngine → MultiTimeframe → Dataset → ML Model\n"
-        info += f"📨 Chat IDs aktif: {CHAT_IDS}\n"
-        info += f"📦 Maks baris per file: {MAX_ROWS}\n"
-        info += "📦 Versi: 1.3"
+    if cmd == "/info":
+        info = (
+            f"XAUUSD_DATA_ENGINE Bot v1.8\n"
+            f"Server time: {datetime.now(ZoneInfo('Asia/Jakarta'))}\n"
+            f"Pipeline: Normalizer -> CandleStatus -> FeatureEngine -> MultiTimeframe -> Dataset -> ML\n"
+            f"Chat IDs: {CHAT_IDS}\n"
+            f"Max rows per file: {MAX_ROWS}"
+        )
         send_message(info)
+        return
 
     else:
-        send_message(f"❌ Command tidak dikenal. Ketik /help untuk daftar command.")
+        send_message(f"Unknown command. Type /help for list.")
+        return
 
-# ============================================================
-# POLLING BOT
-# ============================================================
-
+# ------------------------------------------------------------------
+# POLLING & SCHEDULER
+# ------------------------------------------------------------------
 def run_bot():
     offset = None
-    print("🤖 Bot started polling...")
+    debug("Bot polling started.")
     while True:
         try:
             url = BASE_URL + "/getUpdates"
@@ -396,15 +510,13 @@ def run_bot():
                     if message and "text" in message:
                         chat_id = message["chat"]["id"]
                         text = message["text"]
+                        debug(f"Command from {chat_id}: {text}")
                         handle_command(text, chat_id)
         except Exception as e:
-            print(f"⚠️ Polling error: {e}")
-            time.sleep(2)
+            debug(f"Polling error: {e}")
+            traceback.print_exc()
+            time.sleep(5)
         time.sleep(1)
-
-# ============================================================
-# SCHEDULER
-# ============================================================
 
 last_sent = {"Tokyo": None, "London": None, "NewYork": None}
 
@@ -418,36 +530,38 @@ def is_in_session(now, session):
         return current_hour >= start or current_hour < end
 
 def run_scheduler():
-    print("🕒 Scheduler started. Checking every 60 seconds...")
+    debug("Scheduler started.")
     while True:
         now = datetime.now(ZoneInfo("Asia/Jakarta"))
         for session in SESSION_TIMES:
             if is_in_session(now, session):
                 if last_sent[session] != now.date():
-                    print(f"⏰ Triggering scheduled send for {session} at {now}")
+                    debug(f"Triggering scheduled send for {session} at {now}")
                     try:
                         send_scheduled_data(format="json")
                         last_sent[session] = now.date()
                     except Exception as e:
-                        print(f"❌ Error sending scheduled data: {e}")
+                        debug(f"Scheduled send error: {e}")
+                        traceback.print_exc()
         time.sleep(60)
 
-# ============================================================
+# ------------------------------------------------------------------
 # MAIN
-# ============================================================
-
+# ------------------------------------------------------------------
 def main():
-    print("🚀 Starting Telegram Bot + Scheduler + ML Signal...")
-    print(f"📨 Target chat IDs: {CHAT_IDS}")
-    print(f"📦 Maks baris per file: {MAX_ROWS}")
+    print("Starting Telegram Bot + Scheduler + ML Signal (v1.8)")
+    print(f"Chat IDs: {CHAT_IDS}")
+    print(f"Max rows per file: {MAX_ROWS}")
+
     update_cache()
-    # Pre-train model di awal (opsional)
+    send_message("XAUUSD_DATA_ENGINE Bot v1.8\nSystem ready. Type /help for commands.")
+
     try:
         Predictor.load_model("random_forest")
-        print("✅ Model already exists.")
+        print("Model already exists.")
     except FileNotFoundError:
-        print("🧠 Model not found, training...")
-        train_and_get_model()
+        print("Model not found, training...")
+        train_and_get_model("random_forest")
 
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
@@ -458,7 +572,7 @@ def main():
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("🛑 Shutting down...")
+        print("Shutting down...")
         sys.exit(0)
 
 if __name__ == "__main__":
